@@ -192,14 +192,19 @@ export default function SpeechInput({ onTranscript, placeholder }) {
     if (searchOpen) searchRef.current?.focus();
   }, [searchOpen]);
 
-  const handleResult = useCallback(({ final, interim }) => {
-    if (final && final.trim()) {
+const handleResult = useCallback(({ final, interim }) => {
+  if (final && final.trim()) {
+    if (engine === "webspeech") {
+      accumulatedRef.current = final;
+      setAllText(final);
+    } else {
       const sep = accumulatedRef.current ? " " : "";
-      accumulatedRef.current = (accumulatedRef.current + sep + final.trim());
+      accumulatedRef.current = accumulatedRef.current + sep + final.trim();
       setAllText(accumulatedRef.current);
     }
-    setInterimText(interim || "");
-  }, []);
+  }
+  setInterimText(interim || "");
+}, [engine]);
 
   const handleEnd = useCallback((reason) => {
     if (reason === "permission") setScreen("permission");
@@ -280,6 +285,7 @@ export default function SpeechInput({ onTranscript, placeholder }) {
     setInterimText("");
     setElapsed(0);
     localStorage.removeItem(STORAGE_KEY);
+    webSpeech.resetCommitted();
   };
 
   const handleCopy = () => {
