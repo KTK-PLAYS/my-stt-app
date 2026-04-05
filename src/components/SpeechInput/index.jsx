@@ -242,9 +242,35 @@ const handleResult = useCallback(({ final, interim }) => {
       setTimeout(() => setScreen("main"), 600);
     }
   }, [whisperStatus.phase, screen]);
+// ── mic sounds — only on deliberate user clicks ──
+const playSound = (type) => {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.connect(gain);
+  gain.connect(ctx.destination);
 
+  if (type === "on") {
+    // two rising tones — feels like "activating"
+    osc.frequency.setValueAtTime(440, ctx.currentTime);
+    osc.frequency.setValueAtTime(660, ctx.currentTime + 0.12);
+    gain.gain.setValueAtTime(0.15, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.3);
+  } else {
+    // two falling tones — feels like "deactivating"
+    osc.frequency.setValueAtTime(660, ctx.currentTime);
+    osc.frequency.setValueAtTime(440, ctx.currentTime + 0.12);
+    gain.gain.setValueAtTime(0.15, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.3);
+  }
+};
   const handleStart = async () => {
     try {
+      playSound("on");
       setIsPaused(false);
       if (engine === "webspeech") {
         webSpeech.start();
@@ -271,6 +297,7 @@ const handleResult = useCallback(({ final, interim }) => {
   };
 
   const handleStop = () => {
+    playSound("off");
     engine === "webspeech" ? webSpeech.stop() : whisper.stop();
     setIsRecording(false);
     setIsPaused(false);
