@@ -41,15 +41,23 @@ function LoadingScreen({ phase, progress, browserInfo }) {
     return () => clearInterval(interval);
   }, []);
 
+  // animated dots for the status label
+  const [dots, setDots] = useState("");
+  useEffect(() => {
+    const d = setInterval(() =>
+      setDots(p => p.length >= 3 ? "" : p + "."), 500);
+    return () => clearInterval(d);
+  }, []);
+
   const phaseLabel =
-    phase === "downloading" ? "Downloading speech engine…"
-    : phase === "preparing" ? "Almost ready, setting things up…"
-    : "Finishing up…";
+    phase === "preparing" ? `Setting things up${dots}`
+    : progress > 0        ? `Downloading speech engine${dots}`
+    : `Connecting${dots}`;
 
   const phaseDetail =
-    phase === "downloading"
-      ? "We're downloading a small AI model to your browser. This only happens once — future visits will be instant."
-      : "The engine is initialising. Just a few more seconds.";
+    phase === "preparing"
+      ? "Almost there — loading the model into memory."
+      : "We are downloading a small AI speech model to your browser. This only happens once — all future visits will be instant.";
 
   return (
     <div className="stt-loading-screen">
@@ -64,26 +72,40 @@ function LoadingScreen({ phase, progress, browserInfo }) {
       <div className="stt-loading-bar-track">
         <div
           className="stt-loading-bar-fill"
-          style={{ width: `${phase === "preparing" ? 95 : progress}%` }}
+          style={{
+            width: phase === "preparing"
+              ? "95%"
+              : progress > 0
+              ? `${progress}%`
+              : "0%",
+            // animate a pulse when stuck at 0
+            animation: progress === 0 && phase === "downloading"
+              ? "stt-indeterminate 1.8s ease-in-out infinite"
+              : "none",
+          }}
         />
       </div>
+
       <div className="stt-loading-pct">
-        {phase === "preparing" ? "Preparing…" : `${Math.round(progress)}%`}
+        {phase === "preparing"
+          ? "Almost ready…"
+          : progress > 0
+          ? `${progress}% downloaded`
+          : "Starting download…"}
       </div>
 
       {/* rotating tip */}
       <div className="stt-loading-tip">
-        <span className="stt-loading-tip-label">Did you know?</span>
+        <span className="stt-loading-tip-label">While you wait</span>
         <span>{LOADING_TIPS[tipIndex]}</span>
       </div>
 
-      {/* browser suggestion */}
       {browserInfo.isFirefox && (
         <div className="stt-loading-suggestion">
           <InfoIcon />
           <span>
-            For an even faster experience with no loading time, this feature
-            works instantly on <strong>Chrome</strong> or <strong>Edge</strong>.
+            For an instant experience with no loading time, this feature
+            works immediately on <strong>Chrome</strong> or <strong>Edge</strong>.
           </span>
         </div>
       )}
@@ -210,13 +232,14 @@ const handleResult = useCallback(({ final, interim }) => {
     if (reason === "permission") setScreen("permission");
   }, []);
 
-  const handleWhisperStatus = useCallback((status) => {
-    setWhisperStatus(status);
-    if (status.phase === "ready" && screen === "loading") {
-      // small delay so user sees 100% briefly before transition
-      setTimeout(() => setScreen("main"), 600);
-    }
-  }, [screen]);
+const handleWhisperStatus = useCallback((status) => {
+  setWhisperStatus(status);
+
+  // transition directly here — don't rely on a separate useEffect
+  if (status.phase === "ready") {
+    setTimeout(() => setScreen("main"), 800);
+  }
+}, []);
 
   const webSpeech = useWebSpeech({ onResult: handleResult, onEnd: handleEnd });
   const whisper   = useWhisper({
@@ -236,12 +259,6 @@ const handleResult = useCallback(({ final, interim }) => {
     }
   }, []);
 
-  // ── transition loading → main when whisper ready ──
-  useEffect(() => {
-    if (whisperStatus.phase === "ready" && screen === "loading") {
-      setTimeout(() => setScreen("main"), 600);
-    }
-  }, [whisperStatus.phase, screen]);
 // ── mic sounds — only on deliberate user clicks ──
 const playSound = (type) => {
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
