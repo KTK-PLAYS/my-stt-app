@@ -10,26 +10,18 @@ app.use(cors());
 app.use(express.json());
 
 // ── detect yt-dlp command on startup ──
+
+// Replace the startup detection block in server.cjs
 let YTDLP_CMD = "yt-dlp";
-exec("which yt-dlp", (err) => {
+exec("yt-dlp --version", (err) => {
   if (err) {
-    exec("python3 -m yt_dlp --version", (err2) => {
-      if (!err2) { YTDLP_CMD = "python3 -m yt_dlp"; console.log("Using: python3 -m yt_dlp"); }
-      else console.error("yt-dlp not found by any method");
-    });
+    // If 'yt-dlp' fails, fallback to the python module path common in linux environments
+    YTDLP_CMD = "python3 -m yt_dlp";
+    console.log("Fallback to: python3 -m yt_dlp");
   } else {
-    console.log("Using: yt-dlp");
+    console.log("Using system: yt-dlp");
   }
 });
-
-function run(cmd) {
-  return new Promise((resolve, reject) => {
-    exec(cmd, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) reject(new Error(stderr || err.message));
-      else resolve(stdout.trim());
-    });
-  });
-}
 
 // ── health ──────────────────────────────────────
 app.get("/ping",   (_, res) => res.json({ ok: true }));
