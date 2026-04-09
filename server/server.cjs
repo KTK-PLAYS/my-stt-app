@@ -34,7 +34,7 @@ function downloadYtDlp() {
       return;
     }
 
-    const url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp";
+    const url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux";
     console.log("Downloading yt-dlp binary from GitHub...");
 
     const file = fs.createWriteStream(YTDLP_PATH);
@@ -82,6 +82,32 @@ async function boot() {
   } catch (err) {
     console.error("Failed to set up yt-dlp:", err.message);
     // don't crash — let server start, routes will return clear errors
+  }
+
+  startServer();
+}
+
+async function boot() {
+  try {
+    await downloadYtDlp();
+    const version = await run(`${YTDLP_PATH} --version`);
+    console.log(`yt-dlp version: ${version}`);
+  } catch (err) {
+    console.error("Failed to set up yt-dlp:", err.message);
+  }
+
+  // install ffmpeg via apt (Railway's container has apt)
+  try {
+    await run("ffmpeg -version");
+    console.log("ffmpeg already available");
+  } catch (_) {
+    console.log("Installing ffmpeg...");
+    try {
+      await run("apt-get install -y ffmpeg 2>&1");
+      console.log("ffmpeg installed");
+    } catch (e) {
+      console.error("ffmpeg install failed:", e.message);
+    }
   }
 
   startServer();
