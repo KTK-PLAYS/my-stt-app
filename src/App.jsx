@@ -256,39 +256,50 @@ function DownloaderPanel({ dark }) {
   // FIXED: Your Railway URL (ensure NO trailing slash)
   const BACKEND = "https://my-stt-app-production.up.railway.app";
 
-  useEffect(() => {
-    // Health check using GET /ping
-    fetch(`${BACKEND}/ping`)
-      .then(r => setServerOnline(r.ok))
-      .catch(() => setServerOnline(false));
-  }, []);
+// Inside your DownloaderPanel function...
 
-  const fetchFormats = async () => {
-    if (!url.trim()) return;
-    setStatus("fetching"); 
-    setFormats([]); 
-    setErrorMsg("");
+// 1. Health check fix (GET instead of POST)
+useEffect(() => {
+  fetch(`${BACKEND}/ping`)
+    .then(r => {
+      if (r.ok) setServerOnline(true);
+      else setServerOnline(false);
+    })
+    .catch(() => setServerOnline(false));
+}, [BACKEND]);
+
+// 2. Fetch Formats fix (GET with query params)
+const fetchFormats = async () => {
+  if (!url.trim()) return;
+  setStatus("fetching");
+  setFormats([]);
+  setVideoInfo(null);
+  setSelectedFmt("");
+  setErrorMsg("");
+
+  try {
+    // We must use GET and append the URL as a query string (?url=...)
+    const res = await fetch(`${BACKEND}/formats?url=${encodeURIComponent(url.trim())}`);
     
-    try {
-      // FIXED: Using GET with query parameter as your server.cjs expects
-      const res = await fetch(`${BACKEND}/formats?url=${encodeURIComponent(url.trim())}`);
+    if (!res.ok) {
       const data = await res.json();
-      
-      if (!res.ok) throw new Error(data.error || "Failed to fetch formats");
-      
-      setVideoInfo({ 
-        title: data.title, 
-        thumbnail: data.thumbnail, 
-        duration: data.duration 
-      });
-      setFormats(data.formats);
-      if (data.formats.length) setSelectedFmt(data.formats[0].id);
-      setStatus("ready");
-    } catch (e) {
-      setStatus("error");
-      setErrorMsg(e.message || "Backend error. Check logs.");
+      throw new Error(data.error || "Failed to fetch formats");
     }
-  };
+
+    const data = await res.json();
+    setVideoInfo({
+      title: data.title,
+      thumbnail: data.thumbnail,
+      duration: data.duration
+    });
+    setFormats(data.formats);
+    if (data.formats.length) setSelectedFmt(data.formats[0].id);
+    setStatus("ready");
+  } catch (e) {
+    setStatus("error");
+    setErrorMsg(e.message || "Could not reach server.");
+  }
+};
 
   const startDownload = () => {
     if (!selectedFmt || !url || !videoInfo) return;
