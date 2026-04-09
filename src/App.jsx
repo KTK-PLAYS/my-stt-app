@@ -255,36 +255,49 @@ function DownloaderPanel({ dark }) {
 
   // Check backend health on mount
   useEffect(() => {
-    fetch(`${BACKEND}/ping`, { signal: AbortSignal.timeout(3000) })
-      .then(r => setServerOnline(r.ok))
-      .catch(() => setServerOnline(false));
-  }, []);
+  // Use 'no-cors' or handle the response simply
+  fetch(`${BACKEND}/ping`)
+    .then(r => {
+      if(r.ok || r.status === 200) setServerOnline(true);
+      else setServerOnline(false);
+    })
+    .catch(() => setServerOnline(false));
+}, []);
 
   const reset = () => {
     setUrl(""); setFormats([]); setVideoInfo(null);
     setSelectedFmt(""); setStatus("idle"); setErrorMsg("");
   };
 
-  const fetchFormats = async () => {
-    if (!url.trim()) return;
-    setStatus("fetching"); setFormats([]); setVideoInfo(null); setSelectedFmt(""); setErrorMsg("");
-    try {
-      const res  = await fetch(`${BACKEND}/formats`, {
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({ url: url.trim() }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Failed to fetch formats");
-      setVideoInfo({ title: data.title, thumbnail: data.thumbnail, duration: data.duration });
-      setFormats(data.formats);
-      if (data.formats.length) setSelectedFmt(data.formats[0].id);
-      setStatus("ready");
-    } catch (e) {
-      setStatus("error");
-      setErrorMsg(e.message || "Could not reach server. Make sure server.js is running.");
-    }
-  };
+const fetchFormats = async () => {
+  if (!url.trim()) return;
+  setStatus("fetching"); 
+  setFormats([]); 
+  setVideoInfo(null); 
+  setSelectedFmt(""); 
+  setErrorMsg("");
+  
+  try {
+    // CHANGE: Use GET and pass the URL as a query parameter
+    const res = await fetch(`${BACKEND}/formats?url=${encodeURIComponent(url.trim())}`);
+    
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Failed to fetch formats");
+    
+    // Update state with data from backend
+    setVideoInfo({ 
+      title: data.title, 
+      thumbnail: data.thumbnail, 
+      duration: data.duration 
+    });
+    setFormats(data.formats);
+    if (data.formats.length) setSelectedFmt(data.formats[0].id);
+    setStatus("ready");
+  } catch (e) {
+    setStatus("error");
+    setErrorMsg(e.message || "Could not reach server.");
+  }
+};
 
   const startDownload = () => {
     if (!selectedFmt || !url || !videoInfo) return;
