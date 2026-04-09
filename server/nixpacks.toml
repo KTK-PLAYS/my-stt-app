@@ -1,0 +1,9 @@
+[phases.install]
+cmds = [
+  "apt-get update -y",
+  "apt-get install -y python3 python3-pip ffmpeg",
+  "pip3 install yt-dlp"
+]
+
+[start]
+cmd = "node server.cjs"
