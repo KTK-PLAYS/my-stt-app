@@ -12,14 +12,27 @@ app.use(express.json());
 // ── detect yt-dlp command on startup ──
 
 // Replace the startup detection block in server.cjs
+// Ensure these variables and the run function are at the TOP of your file
 let YTDLP_CMD = "yt-dlp";
+
+// This is the missing function causing your error
+function run(cmd) {
+  return new Promise((resolve, reject) => {
+    // Increase maxBuffer to 10MB to handle large JSON metadata from YouTube
+    exec(cmd, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) reject(new Error(stderr || err.message));
+      else resolve(stdout.trim());
+    });
+  });
+}
+
+// Keep your existing startup detection
 exec("yt-dlp --version", (err) => {
   if (err) {
-    // If 'yt-dlp' fails, fallback to the python module path common in linux environments
     YTDLP_CMD = "python3 -m yt_dlp";
     console.log("Fallback to: python3 -m yt_dlp");
   } else {
-    console.log("Using system: yt-dlp");
+    console.log("Using: yt-dlp");
   }
 });
 
