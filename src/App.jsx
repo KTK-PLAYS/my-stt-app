@@ -233,7 +233,7 @@ const TEMPLATES = [
 // ─────────────────────────────────────────────
 // DOWNLOADER PANEL  (new feature)
 // ─────────────────────────────────────────────
-const BACKEND = "my-stt-app-production.up.railway.app";
+const BACKEND = "https://my-stt-app-production.up.railway.app/";
 
 const SUPPORTED_SITES = [
   { icon:"smart_display",   name:"YouTube"      },
