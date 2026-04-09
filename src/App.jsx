@@ -249,68 +249,65 @@ function DownloaderPanel({ dark }) {
   const [formats,     setFormats]     = useState([]);
   const [videoInfo,   setVideoInfo]   = useState(null);
   const [selectedFmt, setSelectedFmt] = useState("");
-  const [status,      setStatus]      = useState("idle"); // idle | fetching | ready | downloading | error
+  const [status,      setStatus]      = useState("idle"); 
   const [errorMsg,    setErrorMsg]    = useState("");
-  const [serverOnline,setServerOnline]= useState(null);   // null=checking, true, false
+  const [serverOnline,setServerOnline]= useState(null);
 
-  // Check backend health on mount
+  // FIXED: Your Railway URL (ensure NO trailing slash)
+  const BACKEND = "https://my-stt-app-production.up.railway.app";
+
   useEffect(() => {
-  // Use 'no-cors' or handle the response simply
-  fetch(`${BACKEND}/ping`)
-    .then(r => {
-      if(r.ok || r.status === 200) setServerOnline(true);
-      else setServerOnline(false);
-    })
-    .catch(() => setServerOnline(false));
-}, []);
+    // Health check using GET /ping
+    fetch(`${BACKEND}/ping`)
+      .then(r => setServerOnline(r.ok))
+      .catch(() => setServerOnline(false));
+  }, []);
 
-  const reset = () => {
-    setUrl(""); setFormats([]); setVideoInfo(null);
-    setSelectedFmt(""); setStatus("idle"); setErrorMsg("");
+  const fetchFormats = async () => {
+    if (!url.trim()) return;
+    setStatus("fetching"); 
+    setFormats([]); 
+    setErrorMsg("");
+    
+    try {
+      // FIXED: Using GET with query parameter as your server.cjs expects
+      const res = await fetch(`${BACKEND}/formats?url=${encodeURIComponent(url.trim())}`);
+      const data = await res.json();
+      
+      if (!res.ok) throw new Error(data.error || "Failed to fetch formats");
+      
+      setVideoInfo({ 
+        title: data.title, 
+        thumbnail: data.thumbnail, 
+        duration: data.duration 
+      });
+      setFormats(data.formats);
+      if (data.formats.length) setSelectedFmt(data.formats[0].id);
+      setStatus("ready");
+    } catch (e) {
+      setStatus("error");
+      setErrorMsg(e.message || "Backend error. Check logs.");
+    }
   };
-
-const fetchFormats = async () => {
-  if (!url.trim()) return;
-  setStatus("fetching"); 
-  setFormats([]); 
-  setVideoInfo(null); 
-  setSelectedFmt(""); 
-  setErrorMsg("");
-  
-  try {
-    // CHANGE: Use GET and pass the URL as a query parameter
-    const res = await fetch(`${BACKEND}/formats?url=${encodeURIComponent(url.trim())}`);
-    
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Failed to fetch formats");
-    
-    // Update state with data from backend
-    setVideoInfo({ 
-      title: data.title, 
-      thumbnail: data.thumbnail, 
-      duration: data.duration 
-    });
-    setFormats(data.formats);
-    if (data.formats.length) setSelectedFmt(data.formats[0].id);
-    setStatus("ready");
-  } catch (e) {
-    setStatus("error");
-    setErrorMsg(e.message || "Could not reach server.");
-  }
-};
 
   const startDownload = () => {
     if (!selectedFmt || !url || !videoInfo) return;
     setStatus("downloading");
-    const dlUrl = `${BACKEND}/download?url=${encodeURIComponent(url.trim())}&formatId=${encodeURIComponent(selectedFmt)}&title=${encodeURIComponent(videoInfo.title || "download")}`;
+    
+    // FIXED: Correct download endpoint
+    const dlUrl = `${BACKEND}/download?url=${encodeURIComponent(url.trim())}&formatId=${encodeURIComponent(selectedFmt)}`;
+    
     const a = document.createElement("a");
     a.href = dlUrl;
     a.setAttribute("download", "");
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    setTimeout(() => setStatus("ready"), 8000);
+    
+    setTimeout(() => setStatus("ready"), 5000);
   };
+
+  // ... (Keep the rest of your existing styling and return JSX)
 
   // Theme tokens (passed from parent via prop, re-computed locally for clarity)
   const pri     = "#59de9b";
