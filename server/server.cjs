@@ -11,30 +11,32 @@ app.use(express.json());
 
 // ── detect yt-dlp command on startup ──
 
-// Replace the startup detection block in server.cjs
-// Ensure these variables and the run function are at the TOP of your file
+// TOP of server.cjs
+const { exec, spawn } = require("child_process");
 let YTDLP_CMD = "yt-dlp";
 
-// This is the missing function causing your error
+// Improved detection for Railway/Linux
+function detectYtDlp() {
+  exec("yt-dlp --version", (err) => {
+    if (err) {
+      YTDLP_CMD = "python3 -m yt_dlp";
+      console.log("Using Fallback: python3 -m yt_dlp");
+    } else {
+      console.log("Using System: yt-dlp");
+    }
+  });
+}
+detectYtDlp();
+
+// Ensure this function is defined and NOT inside another block
 function run(cmd) {
   return new Promise((resolve, reject) => {
-    // Increase maxBuffer to 10MB to handle large JSON metadata from YouTube
     exec(cmd, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) reject(new Error(stderr || err.message));
       else resolve(stdout.trim());
     });
   });
 }
-
-// Keep your existing startup detection
-exec("yt-dlp --version", (err) => {
-  if (err) {
-    YTDLP_CMD = "python3 -m yt_dlp";
-    console.log("Fallback to: python3 -m yt_dlp");
-  } else {
-    console.log("Using: yt-dlp");
-  }
-});
 
 // ── health ──────────────────────────────────────
 app.get("/ping",   (_, res) => res.json({ ok: true }));
