@@ -300,23 +300,17 @@ const fetchFormats = async () => {
     setErrorMsg(e.message || "Could not reach server.");
   }
 };
-
-  const startDownload = () => {
-    if (!selectedFmt || !url || !videoInfo) return;
-    setStatus("downloading");
-    
-    // FIXED: Correct download endpoint
-    const dlUrl = `${BACKEND}/download?url=${encodeURIComponent(url.trim())}&formatId=${encodeURIComponent(selectedFmt)}`;
-    
-    const a = document.createElement("a");
-    a.href = dlUrl;
-    a.setAttribute("download", "");
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    
-    setTimeout(() => setStatus("ready"), 5000);
-  };
+const startDownload = (formatId) => {
+  const url = `${BACKEND}/download?url=${encodeURIComponent(videoUrl)}&formatId=${encodeURIComponent(formatId)}&title=${encodeURIComponent(videoInfo.title || 'download')}`;
+  
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = '';          // tells browser: download, don't navigate
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+};
 
   // ... (Keep the rest of your existing styling and return JSX)
 
