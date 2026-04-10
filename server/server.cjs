@@ -12,8 +12,10 @@ app.use(cors());
 app.use(express.json());
 
 // ── yt-dlp binary path ────────────────────────────
-// We download it to /tmp so we always have write permission on Railway
 const YTDLP_PATH = "/tmp/yt-dlp";
+
+// Anti-bot user-agent used in every yt-dlp call
+const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 function run(cmd, opts = {}) {
   return new Promise((resolve, reject) => {
@@ -24,18 +26,18 @@ function run(cmd, opts = {}) {
   });
 }
 
-// ── download yt-dlp binary from GitHub releases ───
+// ── download yt-dlp_linux standalone binary from GitHub ───
 function downloadYtDlp() {
   return new Promise((resolve, reject) => {
-    // Check if already downloaded in this container session
     if (fs.existsSync(YTDLP_PATH)) {
       console.log("yt-dlp already exists at", YTDLP_PATH);
       resolve();
       return;
     }
 
+    // yt-dlp_linux = true standalone ELF binary — no Python needed
     const url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux";
-    console.log("Downloading yt-dlp binary from GitHub...");
+    console.log("Downloading yt-dlp_linux binary from GitHub...");
 
     const file = fs.createWriteStream(YTDLP_PATH);
 
@@ -44,7 +46,6 @@ function downloadYtDlp() {
 
       const mod = downloadUrl.startsWith("https") ? https : require("http");
       mod.get(downloadUrl, (res) => {
-        // follow redirects (GitHub uses them)
         if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307) {
           download(res.headers.location, redirectCount + 1);
           return;
@@ -56,7 +57,6 @@ function downloadYtDlp() {
         res.pipe(file);
         file.on("finish", () => {
           file.close();
-          // make executable
           fs.chmodSync(YTDLP_PATH, "755");
           console.log("yt-dlp downloaded and made executable");
           resolve();
@@ -71,32 +71,19 @@ function downloadYtDlp() {
   });
 }
 
-// ── boot sequence ─────────────────────────────────
+// ── single boot sequence ──────────────────────────
 async function boot() {
+  // 1. Download yt-dlp binary
   try {
     await downloadYtDlp();
-
-    // verify it works
-    const version = await run(`${YTDLP_PATH} --version`);
+    const version = await run(`"${YTDLP_PATH}" --version`);
     console.log(`yt-dlp version: ${version}`);
   } catch (err) {
     console.error("Failed to set up yt-dlp:", err.message);
-    // don't crash — let server start, routes will return clear errors
+    // don't crash — routes will return clear errors
   }
 
-  startServer();
-}
-
-async function boot() {
-  try {
-    await downloadYtDlp();
-    const version = await run(`${YTDLP_PATH} --version`);
-    console.log(`yt-dlp version: ${version}`);
-  } catch (err) {
-    console.error("Failed to set up yt-dlp:", err.message);
-  }
-
-  // install ffmpeg via apt (Railway's container has apt)
+  // 2. Try to get ffmpeg (via apt if missing)
   try {
     await run("ffmpeg -version");
     console.log("ffmpeg already available");
@@ -115,19 +102,19 @@ async function boot() {
 
 function startServer() {
 
-  // ── health ────────────────────────────────────────
+  // ── health ──────────────────────────────────────
   app.get("/ping",   (_, res) => res.json({ ok: true }));
   app.get("/health", (_, res) => res.json({ ok: true }));
 
-  // ── diagnostic ────────────────────────────────────
+  // ── diagnostic ──────────────────────────────────
   app.get("/check", async (req, res) => {
     const results = { ytdlp_path: YTDLP_PATH, exists: fs.existsSync(YTDLP_PATH) };
-    try { results.version = await run(`${YTDLP_PATH} --version`); } catch(e) { results.version = e.message; }
-    try { results.ffmpeg  = await run("ffmpeg -version 2>&1 | head -1"); } catch(e) { results.ffmpeg = "not found"; }
+    try { results.version = await run(`"${YTDLP_PATH}" --version`); } catch (e) { results.version = e.message; }
+    try { results.ffmpeg  = await run("ffmpeg -version 2>&1 | head -1"); } catch (e) { results.ffmpeg = "not found"; }
     res.json(results);
   });
 
-  // ── GET /formats?url= ─────────────────────────────
+  // ── GET /formats?url= ───────────────────────────
   app.get("/formats", async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: "No URL provided" });
@@ -137,7 +124,14 @@ function startServer() {
     }
 
     try {
-      const raw  = await run(`"${YTDLP_PATH}" --dump-json --no-playlist "${url}"`);
+      const raw = await run(
+        `"${YTDLP_PATH}" --dump-json --no-playlist ` +
+        `--no-check-certificates --extractor-retries 3 ` +
+        `--user-agent "${USER_AGENT}" ` +
+        `--add-header "Accept-Language:en-US,en;q=0.9" ` +
+        `"${url}"`
+      );
+
       const info = JSON.parse(raw);
 
       const seen    = new Set();
@@ -171,26 +165,9 @@ function startServer() {
       console.error("formats error:", err.message);
       res.status(500).json({ error: "Could not fetch video info: " + err.message });
     }
-  
-  
-    const raw = await run(
-  `"${YTDLP_PATH}" --dump-json --no-playlist ` +
-  `--no-check-certificates --extractor-retries 3 ` +
-  `--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" ` +
-  `"${url}"`
-);
-
   });
 
-
-
-
-
-
-
-
-
-  // ── GET /download?url=&formatId=&title= ───────────
+  // ── GET /download?url=&formatId=&title= ─────────
   app.get("/download", async (req, res) => {
     const { url, formatId, title } = req.query;
     if (!url || !formatId) return res.status(400).send("Missing url or formatId");
@@ -213,6 +190,10 @@ function startServer() {
           "-f", fmtArg,
           "--merge-output-format", "mp4",
           "--no-playlist",
+          "--no-check-certificates",
+          "--extractor-retries", "3",
+          "--user-agent", USER_AGENT,
+          "--add-header", "Accept-Language:en-US,en;q=0.9",
           "-o", outPath,
           url,
         ];
@@ -243,22 +224,6 @@ function startServer() {
       console.error("download error:", err.message);
       if (!res.headersSent) res.status(500).send("Download failed: " + err.message);
     }
-  
-
-
-
-    const args = [
-  "-f", fmtArg,
-  "--merge-output-format", "mp4",
-  "--no-playlist",
-  "--no-check-certificates",
-  "--extractor-retries", "3",
-  "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "-o", outPath,
-  url,
-];
-
-
   });
 
   app.listen(PORT, () => {
