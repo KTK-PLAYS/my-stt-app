@@ -300,19 +300,33 @@ const fetchFormats = async () => {
     setErrorMsg(e.message || "Could not reach server.");
   }
 };
-const startDownload = (formatId) => {
-  const url = `${BACKEND}/download?url=${encodeURIComponent(videoUrl)}&formatId=${encodeURIComponent(formatId)}&title=${encodeURIComponent(videoInfo.title || 'download')}`;
-  
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = '';          // tells browser: download, don't navigate
-  a.style.display = 'none';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
+
+const reset = () => {
+    setUrl("");
+    setFormats([]);
+    setVideoInfo(null);
+    setSelectedFmt("");
+    setStatus("idle");
+    setErrorMsg("");
 };
 
-  // ... (Keep the rest of your existing styling and return JSX)
+const startDownload = () => {
+    if (!selectedFmt || !url || !videoInfo) return;
+    setStatus("downloading");
+
+    const dlUrl = `${BACKEND}/download?url=${encodeURIComponent(url.trim())}&formatId=${encodeURIComponent(selectedFmt)}&title=${encodeURIComponent(videoInfo.title || "download")}`;
+    
+    const a = document.createElement("a");
+    a.href = dlUrl;
+    a.setAttribute("download", ""); // Tells browser: download, don't navigate
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+
+    setTimeout(() => setStatus("ready"), 8000);
+  };
+
 
   // Theme tokens (passed from parent via prop, re-computed locally for clarity)
   const pri     = "#59de9b";
