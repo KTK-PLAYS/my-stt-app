@@ -1,3 +1,22 @@
+/**
+ * server.cjs  —  Speech Studio Media Backend
+ * ─────────────────────────────────────────────────────────────────
+ * Deploy on Railway. Set these env variables in Railway dashboard:
+ *
+ *   PORT              → set automatically by Railway
+ *   YOUTUBE_COOKIES   → (optional, legacy) Netscape cookie file content
+ *   YT_TOKEN_DATA     → (auto-managed) stores OAuth2 token JSON — Railway
+ *                       will update this automatically via the /save-token
+ *                       endpoint the first time you authenticate.
+ *
+ * FIRST-TIME OAUTH SETUP (one time only):
+ *   1. Deploy this server to Railway
+ *   2. Visit  https://your-railway-url.up.railway.app/auth-url
+ *   3. Follow the printed instructions to get the token
+ *   4. Done — the token auto-refreshes from then on
+ * ─────────────────────────────────────────────────────────────────
+ */
+
 const express         = require("express");
 const cors            = require("cors");
 const { exec, spawn } = require("child_process");
@@ -11,16 +30,17 @@ const PORT = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
-// ── binary paths (all in /tmp — always writable on Railway) ──
+// ── binary + token paths ──────────────────────────────────────
 const YTDLP_PATH   = "/tmp/yt-dlp";
 const FFMPEG_PATH  = "/tmp/ffmpeg";
 const COOKIES_PATH = "/tmp/yt-cookies.txt";
+const TOKEN_PATH   = "/tmp/yt-oauth.json";   // yt-dlp token cache file
 
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// ── generic exec helper ───────────────────────────────────────
+// ── exec helper ───────────────────────────────────────────────
 function run(cmd, opts = {}) {
   return new Promise((resolve, reject) => {
     exec(cmd, { maxBuffer: 10 * 1024 * 1024, timeout: 120000, ...opts },
@@ -32,172 +52,174 @@ function run(cmd, opts = {}) {
   });
 }
 
-// ── generic binary downloader (follows redirects, no curl/wget needed) ──
+// ── binary downloader ─────────────────────────────────────────
 function downloadBinary(url, destPath, label) {
   return new Promise((resolve, reject) => {
-    if (fs.existsSync(destPath)) {
-      console.log(`${label} already exists at ${destPath}`);
-      resolve();
-      return;
-    }
-
-    console.log(`Downloading ${label} from GitHub...`);
+    if (fs.existsSync(destPath)) { console.log(`${label} already cached`); resolve(); return; }
+    console.log(`Downloading ${label}…`);
     const file = fs.createWriteStream(destPath);
-
     function fetch(fetchUrl, hops = 0) {
       if (hops > 8) { reject(new Error("Too many redirects")); return; }
       const mod = fetchUrl.startsWith("https") ? https : require("http");
       mod.get(fetchUrl, (res) => {
-        if ([301, 302, 307, 308].includes(res.statusCode)) {
-          fetch(res.headers.location, hops + 1);
-          return;
-        }
-        if (res.statusCode !== 200) {
-          reject(new Error(`HTTP ${res.statusCode} downloading ${label}`));
-          return;
-        }
+        if ([301,302,307,308].includes(res.statusCode)) { fetch(res.headers.location, hops+1); return; }
+        if (res.statusCode !== 200) { reject(new Error(`HTTP ${res.statusCode} for ${label}`)); return; }
         res.pipe(file);
-        file.on("finish", () => {
-          file.close();
-          fs.chmodSync(destPath, "755");
-          console.log(`${label} downloaded and made executable`);
-          resolve();
-        });
-      }).on("error", (err) => {
-        fs.unlink(destPath, () => {});
-        reject(err);
-      });
+        file.on("finish", () => { file.close(); fs.chmodSync(destPath,"755"); console.log(`${label} ready`); resolve(); });
+      }).on("error", (e) => { fs.unlink(destPath,()=>{}); reject(e); });
     }
-
     fetch(url);
   });
 }
 
-// ── write YouTube cookies from env variable ───────────────────
+// ─────────────────────────────────────────────────────────────
+// TOKEN MANAGEMENT
+//
+// yt-dlp OAuth2 stores a JSON token file at TOKEN_PATH.
+// We persist this between Railway deploys by:
+//   1. On boot  → restore token file from YT_TOKEN_DATA env var
+//   2. After each download → if the token file changed, update the
+//      env var via Railway API (requires RAILWAY_TOKEN + service ID)
+//      OR just log the new content so you can copy-paste it once.
+// ─────────────────────────────────────────────────────────────
+
+function restoreToken() {
+  const data = process.env.YT_TOKEN_DATA;
+  if (data && data.trim()) {
+    try {
+      // Validate it parses as JSON before writing
+      JSON.parse(data);
+      fs.writeFileSync(TOKEN_PATH, data, "utf8");
+      console.log("✅ OAuth token restored from YT_TOKEN_DATA env var");
+    } catch {
+      console.warn("⚠️  YT_TOKEN_DATA is set but is not valid JSON — ignoring");
+    }
+  } else {
+    console.warn("ℹ️  YT_TOKEN_DATA not set — YouTube may require auth. Visit /auth-url to set up.");
+  }
+}
+
+// Read the current token file and return its content (or null)
+function readToken() {
+  try {
+    if (fs.existsSync(TOKEN_PATH)) return fs.readFileSync(TOKEN_PATH, "utf8");
+  } catch {}
+  return null;
+}
+
+// Called after every yt-dlp run to capture any refreshed token
+async function persistTokenIfChanged(previousTokenData) {
+  const current = readToken();
+  if (!current) return;
+  if (current === previousTokenData) return; // unchanged
+
+  console.log("\n🔄 OAuth token was refreshed by yt-dlp");
+
+  // ── Option A: Railway API auto-update ─────────────────────
+  // If you set RAILWAY_API_TOKEN + RAILWAY_SERVICE_ID in Railway dashboard,
+  // the token env var is updated automatically without any manual step.
+  const railwayToken   = process.env.RAILWAY_API_TOKEN;
+  const railwayService = process.env.RAILWAY_SERVICE_ID;
+  const railwayEnvId   = process.env.RAILWAY_ENVIRONMENT_ID || "production";
+
+  if (railwayToken && railwayService) {
+    try {
+      await updateRailwayEnvVar("YT_TOKEN_DATA", current, railwayToken, railwayService, railwayEnvId);
+      console.log("✅ YT_TOKEN_DATA updated in Railway automatically");
+    } catch (e) {
+      console.warn("⚠️  Railway auto-update failed:", e.message);
+      logTokenForManualCopy(current);
+    }
+  } else {
+    // ── Option B: Just log it so you can copy-paste once ──
+    logTokenForManualCopy(current);
+  }
+}
+
+function logTokenForManualCopy(tokenData) {
+  console.log("\n════════════════════════════════════════════════");
+  console.log("TOKEN REFRESHED — copy the value below into");
+  console.log("Railway dashboard → Variables → YT_TOKEN_DATA:");
+  console.log("────────────────────────────────────────────────");
+  console.log(tokenData);
+  console.log("════════════════════════════════════════════════\n");
+}
+
+// ── Railway Variables API (GraphQL) ──────────────────────────
+function updateRailwayEnvVar(name, value, apiToken, serviceId, environmentId) {
+  return new Promise((resolve, reject) => {
+    const query = JSON.stringify({
+      query: `mutation variableUpsert($input: VariableUpsertInput!) {
+        variableUpsert(input: $input)
+      }`,
+      variables: {
+        input: {
+          projectId:     process.env.RAILWAY_PROJECT_ID || "",
+          serviceId,
+          environmentId,
+          name,
+          value,
+        },
+      },
+    });
+
+    const options = {
+      hostname: "backboard.railway.app",
+      path:     "/graphql/v2",
+      method:   "POST",
+      headers:  {
+        "Content-Type":   "application/json",
+        "Authorization":  `Bearer ${apiToken}`,
+        "Content-Length": Buffer.byteLength(query),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let body = "";
+      res.on("data", d => body += d);
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(body);
+          if (parsed.errors) reject(new Error(JSON.stringify(parsed.errors)));
+          else resolve(parsed);
+        } catch { reject(new Error("Invalid Railway API response")); }
+      });
+    });
+    req.on("error", reject);
+    req.write(query);
+    req.end();
+  });
+}
+
+// ── setup cookies (legacy fallback) ──────────────────────────
 function setupCookies() {
   const data = process.env.YOUTUBE_COOKIES;
   if (data && data.trim()) {
     fs.writeFileSync(COOKIES_PATH, data, "utf8");
-    console.log("YouTube cookies written to", COOKIES_PATH);
-  } else {
-    console.warn("YOUTUBE_COOKIES env not set — YouTube may block some requests");
+    console.log("Legacy YouTube cookies written");
   }
 }
 
-// ── boot ──────────────────────────────────────────────────────
-async function boot() {
-  setupCookies();
-
-  // 1. yt-dlp standalone binary (no Python needed)
-  try {
-    await downloadBinary(
-      "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux",
-      YTDLP_PATH,
-      "yt-dlp"
-    );
-    const v = await run(`"${YTDLP_PATH}" --version`);
-    console.log(`yt-dlp version: ${v}`);
-  } catch (e) {
-    console.error("yt-dlp setup failed:", e.message);
+// ── auth args builder ─────────────────────────────────────────
+// Prefers OAuth token file → falls back to cookies → falls back to nothing
+function getAuthArgs() {
+  if (fs.existsSync(TOKEN_PATH)) {
+    return ["--username", "oauth2", "--password", "", "--cache-dir", "/tmp/yt-dlp-cache"];
   }
-
-  // 2. ffmpeg static binary — downloaded from johnvansickle.com builds
-  //    These are pre-compiled, single-file, no dependencies, ~70MB.
-  //    We grab only the ffmpeg binary out of the tar archive using Node streams.
-  try {
-    if (fs.existsSync(FFMPEG_PATH)) {
-      console.log("ffmpeg already exists at", FFMPEG_PATH);
-    } else {
-      console.log("Downloading ffmpeg static binary...");
-      await downloadFfmpeg();
-    }
-    const fv = await run(`"${FFMPEG_PATH}" -version 2>&1 | head -1`);
-    console.log(`ffmpeg: ${fv}`);
-  } catch (e) {
-    console.error("ffmpeg setup failed:", e.message);
-    console.warn("Downloads will work but video+audio won't be merged (no ffmpeg).");
+  if (fs.existsSync(COOKIES_PATH)) {
+    return ["--cookies", COOKIES_PATH];
   }
-
-  startServer();
+  return [];
 }
 
-// ── download & extract just the ffmpeg binary from the static build ──
-function downloadFfmpeg() {
-  return new Promise((resolve, reject) => {
-    // johnvansickle.com hosts static musl builds — single tar.xz containing ffmpeg + ffprobe
-    const tarUrl =
-      "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz";
-
-    // We'll stream → gunzip/unxz → tar extract → pick the ffmpeg file
-    // Node doesn't have native xz support so we pipe through the system `tar` command.
-    // Railway containers have `tar` and `xz` even on minimal images.
-    const cmd =
-      `curl -sL "${tarUrl}" | tar -xJ --wildcards --no-anchored "*/ffmpeg" ` +
-      `-O > "${FFMPEG_PATH}" && chmod 755 "${FFMPEG_PATH}"`;
-
-    exec(cmd, { timeout: 180000, maxBuffer: 100 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) {
-        // curl not available — fall back to pure Node https stream + system tar
-        console.log("curl not found, trying Node https stream...");
-        downloadFfmpegNodeStream().then(resolve).catch(reject);
-        return;
-      }
-      console.log("ffmpeg extracted successfully");
-      resolve();
-    });
-  });
-}
-
-// ── pure-Node fallback: download tar.xz then extract with child tar ──
-function downloadFfmpegNodeStream() {
-  return new Promise((resolve, reject) => {
-    const tarUrl =
-      "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz";
-    const tmpTar = "/tmp/ffmpeg.tar.xz";
-    const file   = fs.createWriteStream(tmpTar);
-
-    console.log("Streaming ffmpeg tar.xz...");
-
-    function fetch(url, hops = 0) {
-      if (hops > 8) { reject(new Error("Too many redirects")); return; }
-      const mod = url.startsWith("https") ? https : require("http");
-      mod.get(url, (res) => {
-        if ([301, 302, 307, 308].includes(res.statusCode)) {
-          fetch(res.headers.location, hops + 1);
-          return;
-        }
-        if (res.statusCode !== 200) {
-          reject(new Error(`HTTP ${res.statusCode} for ffmpeg tar`));
-          return;
-        }
-        res.pipe(file);
-        file.on("finish", () => {
-          file.close();
-          console.log("tar.xz downloaded, extracting ffmpeg...");
-          const cmd =
-            `tar -xJf "${tmpTar}" --wildcards --no-anchored "*/ffmpeg" ` +
-            `-O > "${FFMPEG_PATH}" && chmod 755 "${FFMPEG_PATH}"`;
-          exec(cmd, { timeout: 120000 }, (err) => {
-            try { fs.unlinkSync(tmpTar); } catch {}
-            if (err) { reject(err); return; }
-            console.log("ffmpeg extracted successfully");
-            resolve();
-          });
-        });
-      }).on("error", reject);
-    }
-
-    fetch(tarUrl);
-  });
-}
-
-// ── helpers ───────────────────────────────────────────────────
-function getCookieArgs() {
-  return fs.existsSync(COOKIES_PATH) ? ["--cookies", COOKIES_PATH] : [];
-}
-
-function getCookieFlag() {
-  return fs.existsSync(COOKIES_PATH) ? `--cookies "${COOKIES_PATH}"` : "";
+function getAuthFlag() {
+  if (fs.existsSync(TOKEN_PATH)) {
+    return `--username oauth2 --password "" --cache-dir /tmp/yt-dlp-cache`;
+  }
+  if (fs.existsSync(COOKIES_PATH)) {
+    return `--cookies "${COOKIES_PATH}"`;
+  }
+  return "";
 }
 
 function getFfmpegArgs() {
@@ -208,30 +230,185 @@ function getFfmpegFlag() {
   return fs.existsSync(FFMPEG_PATH) ? `--ffmpeg-location "${FFMPEG_PATH}"` : "";
 }
 
-// ── server ────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// BOOT
+// ─────────────────────────────────────────────────────────────
+async function boot() {
+  setupCookies();
+  restoreToken();
+
+  // 1. yt-dlp binary
+  try {
+    await downloadBinary(
+      "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux",
+      YTDLP_PATH, "yt-dlp"
+    );
+    const v = await run(`"${YTDLP_PATH}" --version`);
+    console.log(`yt-dlp ${v}`);
+  } catch (e) { console.error("yt-dlp setup failed:", e.message); }
+
+  // 2. ffmpeg binary
+  try {
+    if (!fs.existsSync(FFMPEG_PATH)) {
+      console.log("Downloading ffmpeg…");
+      await downloadFfmpeg();
+    } else {
+      console.log("ffmpeg already cached");
+    }
+    const fv = await run(`"${FFMPEG_PATH}" -version 2>&1 | head -1`);
+    console.log(fv);
+  } catch (e) {
+    console.warn("ffmpeg unavailable — video+audio won't be merged:", e.message);
+  }
+
+  startServer();
+}
+
+// ── ffmpeg download ───────────────────────────────────────────
+function downloadFfmpeg() {
+  return new Promise((resolve, reject) => {
+    const tarUrl =
+      "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz";
+    const cmd =
+      `curl -sL "${tarUrl}" | tar -xJ --wildcards --no-anchored "*/ffmpeg" ` +
+      `-O > "${FFMPEG_PATH}" && chmod 755 "${FFMPEG_PATH}"`;
+    exec(cmd, { timeout:180000, maxBuffer:100*1024*1024 }, (err) => {
+      if (err) { downloadFfmpegNodeStream().then(resolve).catch(reject); return; }
+      console.log("ffmpeg extracted"); resolve();
+    });
+  });
+}
+
+function downloadFfmpegNodeStream() {
+  return new Promise((resolve, reject) => {
+    const tarUrl = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz";
+    const tmpTar = "/tmp/ffmpeg.tar.xz";
+    const file   = fs.createWriteStream(tmpTar);
+    function fetch(url, hops=0) {
+      if (hops>8) { reject(new Error("Too many redirects")); return; }
+      const mod = url.startsWith("https") ? https : require("http");
+      mod.get(url, (res) => {
+        if ([301,302,307,308].includes(res.statusCode)) { fetch(res.headers.location,hops+1); return; }
+        if (res.statusCode!==200) { reject(new Error(`HTTP ${res.statusCode}`)); return; }
+        res.pipe(file);
+        file.on("finish", () => {
+          file.close();
+          const cmd = `tar -xJf "${tmpTar}" --wildcards --no-anchored "*/ffmpeg" -O > "${FFMPEG_PATH}" && chmod 755 "${FFMPEG_PATH}"`;
+          exec(cmd, {timeout:120000}, (err) => {
+            try{fs.unlinkSync(tmpTar);}catch{}
+            if (err) { reject(err); return; }
+            console.log("ffmpeg extracted"); resolve();
+          });
+        });
+      }).on("error", reject);
+    }
+    fetch(tarUrl);
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
+// SERVER ROUTES
+// ─────────────────────────────────────────────────────────────
 function startServer() {
 
   app.get("/ping",   (_, res) => res.json({ ok: true }));
   app.get("/health", (_, res) => res.json({ ok: true }));
 
-  // Diagnostic — visit /check to see binary status
-  app.get("/check", async (req, res) => {
+  // ── /check — binary + auth status ───────────────────────
+  app.get("/check", async (_, res) => {
     const r = {
-      ytdlp:  { path: YTDLP_PATH,  exists: fs.existsSync(YTDLP_PATH)  },
-      ffmpeg: { path: FFMPEG_PATH, exists: fs.existsSync(FFMPEG_PATH) },
-      cookies: fs.existsSync(COOKIES_PATH),
+      ytdlp:    { path: YTDLP_PATH,   exists: fs.existsSync(YTDLP_PATH)   },
+      ffmpeg:   { path: FFMPEG_PATH,  exists: fs.existsSync(FFMPEG_PATH)  },
+      oauthToken: {
+        path:   TOKEN_PATH,
+        exists: fs.existsSync(TOKEN_PATH),
+        envSet: !!process.env.YT_TOKEN_DATA,
+      },
+      cookies:  fs.existsSync(COOKIES_PATH),
     };
-    try { r.ytdlp.version  = await run(`"${YTDLP_PATH}" --version`); }         catch (e) { r.ytdlp.version  = e.message; }
-    try { r.ffmpeg.version = await run(`"${FFMPEG_PATH}" -version 2>&1 | head -1`); } catch (e) { r.ffmpeg.version = e.message; }
+    try { r.ytdlp.version  = await run(`"${YTDLP_PATH}" --version`); }          catch(e){ r.ytdlp.error  = e.message; }
+    try { r.ffmpeg.version = await run(`"${FFMPEG_PATH}" -version 2>&1 | head -1`); } catch(e){ r.ffmpeg.error = e.message; }
+    if (r.oauthToken.exists) {
+      try { r.oauthToken.data = JSON.parse(readToken()); } catch { r.oauthToken.parseError = true; }
+    }
     res.json(r);
   });
 
-  // ── GET /formats?url= ─────────────────────────────────────
+  // ── /auth-url — prints OAuth2 instructions ──────────────
+  // Visit this endpoint in your browser to start the OAuth flow.
+  // yt-dlp will print a URL + code; you visit the URL, enter the code,
+  // and the token is saved to TOKEN_PATH automatically.
+  app.get("/auth-url", async (req, res) => {
+    if (!fs.existsSync(YTDLP_PATH)) {
+      return res.status(503).send("yt-dlp not ready yet. Try again in 30s.");
+    }
+
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader("Transfer-Encoding", "chunked");
+
+    res.write("Starting yt-dlp OAuth2 flow...\n\n");
+    res.write("yt-dlp will print a URL and a code below.\n");
+    res.write("1. Open the Google URL printed below in a NEW browser tab\n");
+    res.write("2. Sign in with your Google account and enter the code shown\n");
+    res.write("3. Come back to THIS tab — the token will print at the bottom\n");
+    res.write("4. Copy the JSON and paste it into Railway → Variables → YT_TOKEN_DATA\n\n");
+    res.write("────────────────────────────────────────\n\n");
+
+    const proc = spawn(YTDLP_PATH, [
+      "--username", "oauth2",
+      "--password", "",
+      "--cache-dir", "/tmp/yt-dlp-cache",
+      "--skip-download",
+      "--no-playlist",
+      "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    ]);
+
+    proc.stdout.on("data", d => res.write(d.toString()));
+    proc.stderr.on("data", d => res.write(d.toString()));
+
+    proc.on("close", () => {
+      const token = readToken();
+      if (token) {
+        res.write("\n\n════════════════════════════════════════\n");
+        res.write("TOKEN SAVED - copy everything between the lines below\n");
+        res.write("and paste it into Railway → Variables → YT_TOKEN_DATA:\n\n");
+        res.write("--- START COPYING FROM NEXT LINE ---\n");
+        res.write(token);
+        res.write("\n--- STOP COPYING AT PREVIOUS LINE ---\n");
+        res.write("════════════════════════════════════════\n");
+      } else {
+        res.write("\n\nNo token file found.\n");
+        res.write("This usually means the token already existed from a previous auth.\n");
+        res.write("Try visiting /check to see the current auth status.\n");
+      }
+      res.end();
+    });
+
+    req.on("close", () => { try { proc.kill(); } catch {} });
+  });
+
+  // ── /save-token  POST { token: "..." } ──────────────────
+  // Manually post a token JSON string to save it (and update env var)
+  app.post("/save-token", async (req, res) => {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ error: "Missing token field" });
+    try {
+      JSON.parse(token); // validate
+      fs.writeFileSync(TOKEN_PATH, token, "utf8");
+      await persistTokenIfChanged("__force_update__"); // always persist
+      res.json({ ok: true, message: "Token saved and persisted" });
+    } catch (e) {
+      res.status(400).json({ error: "Invalid JSON token: " + e.message });
+    }
+  });
+
+  // ── GET /formats?url= ───────────────────────────────────
   app.get("/formats", async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: "No URL provided" });
-    if (!fs.existsSync(YTDLP_PATH))
-      return res.status(503).json({ error: "yt-dlp not ready yet." });
+    if (!fs.existsSync(YTDLP_PATH)) return res.status(503).json({ error: "yt-dlp not ready yet." });
+
+    const prevToken = readToken();
 
     try {
       const raw = await run(
@@ -239,43 +416,42 @@ function startServer() {
         `--no-check-certificates --extractor-retries 3 ` +
         `--user-agent "${USER_AGENT}" ` +
         `--add-header "Accept-Language:en-US,en;q=0.9" ` +
-        `${getCookieFlag()} ` +
+        `${getAuthFlag()} ` +
         `${getFfmpegFlag()} ` +
         `"${url}"`
       );
 
-      const info = JSON.parse(raw);
+      // Persist token if yt-dlp refreshed it during this request
+      persistTokenIfChanged(prevToken).catch(e => console.warn("Token persist error:", e.message));
 
+      const info            = JSON.parse(raw);
       const ffmpegAvailable = fs.existsSync(FFMPEG_PATH);
 
-      const seen = new Set();
+      const seen    = new Set();
       const formats = (info.formats || [])
         .filter(f => {
           if (!f.ext) return false;
-          // Without ffmpeg we can only serve pre-muxed formats (have both video+audio)
-          // or pure audio. We filter out video-only streams when ffmpeg is absent.
           if (!ffmpegAvailable && f.vcodec !== "none" && f.acodec === "none") return false;
           return f.vcodec !== "none" || f.acodec !== "none";
         })
         .map(f => {
           const isAudio    = f.vcodec === "none";
-          const resolution = isAudio ? "audio" : (f.resolution || (f.height ? f.height + "p" : "unknown"));
+          const resolution = isAudio ? "audio" : (f.resolution || (f.height ? f.height+"p" : "unknown"));
           const label      = isAudio
-            ? `Audio - ${f.ext.toUpperCase()}${f.abr ? " " + Math.round(f.abr) + "kbps" : ""}`.trim()
-            : `${resolution} - ${f.ext.toUpperCase()}${f.fps ? " " + f.fps + "fps" : ""}`.trim();
+            ? `Audio — ${f.ext.toUpperCase()}${f.abr ? " "+Math.round(f.abr)+"kbps" : ""}`.trim()
+            : `${resolution} — ${f.ext.toUpperCase()}${f.fps ? " "+f.fps+"fps" : ""}`.trim();
           return {
-            id:        f.format_id,
+            id:       f.format_id,
             label,
             isAudio,
-            hasAudio:  f.acodec !== "none",
-            filesize:  f.filesize || f.filesize_approx || null,
-            res:       isAudio ? 0 : (f.height || 0),
+            hasAudio: f.acodec !== "none",
+            filesize: f.filesize || f.filesize_approx || null,
+            res:      isAudio ? 0 : (f.height || 0),
           };
         })
         .filter(f => {
           if (seen.has(f.label)) return false;
-          seen.add(f.label);
-          return true;
+          seen.add(f.label); return true;
         })
         .sort((a, b) => b.res - a.res);
 
@@ -293,21 +469,20 @@ function startServer() {
     }
   });
 
-  // ── GET /download?url=&formatId=&title= ───────────────────
+  // ── GET /download?url=&formatId=&title= ─────────────────
   app.get("/download", async (req, res) => {
     const { url, formatId, title } = req.query;
     if (!url || !formatId) return res.status(400).send("Missing url or formatId");
     if (!fs.existsSync(YTDLP_PATH)) return res.status(503).send("yt-dlp not ready.");
 
-    const safeTitle = (title || "download").replace(/[^\w\s-]/g, "").trim() || "download";
+    const prevToken = readToken();
+    const safeTitle = (title || "download").replace(/[^\w\s-]/g,"").trim() || "download";
     const stamp     = Date.now();
     const outPath   = path.join(os.tmpdir(), `ststudio-${stamp}.%(ext)s`);
     const ffmpeg    = fs.existsSync(FFMPEG_PATH);
 
     try {
       await new Promise((resolve, reject) => {
-        // If ffmpeg available: merge best video + best audio
-        // If no ffmpeg: download the format as-is (pre-muxed or audio-only)
         const fmtArg = ffmpeg
           ? (formatId === "bestaudio" ? "bestaudio/best" : `${formatId}+bestaudio/best[ext=mp4]/best`)
           : formatId;
@@ -319,34 +494,30 @@ function startServer() {
           "--extractor-retries", "3",
           "--user-agent", USER_AGENT,
           "--add-header", "Accept-Language:en-US,en;q=0.9",
-          ...getCookieArgs(),
+          ...getAuthArgs(),
           ...getFfmpegArgs(),
         ];
 
-        // Only request mp4 merge if ffmpeg is present
-        if (ffmpeg) {
-          args.push("--merge-output-format", "mp4");
-        }
+        if (ffmpeg) args.push("--merge-output-format", "mp4");
 
         args.push("-o", outPath, url);
 
-        console.log("Downloading:", url, "| format:", formatId, "| ffmpeg:", ffmpeg);
+        console.log(`Downloading: ${url} | format: ${formatId} | ffmpeg: ${ffmpeg}`);
         const proc = spawn(YTDLP_PATH, args);
         proc.stderr.on("data", d => process.stderr.write(d));
-        proc.on("close", code =>
-          code === 0 ? resolve() : reject(new Error(`yt-dlp exited ${code}`))
-        );
+        proc.on("close", code => code===0 ? resolve() : reject(new Error(`yt-dlp exited ${code}`)));
       });
 
-      // Find the output file (could be .mp4, .webm, .m4a, etc.)
-      const allFiles = fs.readdirSync(os.tmpdir())
-        .filter(f => f.startsWith(`ststudio-${stamp}`));
-      const outFile = allFiles.sort().pop();
+      // Persist refreshed token after download
+      persistTokenIfChanged(prevToken).catch(e => console.warn("Token persist error:", e.message));
+
+      const allFiles = fs.readdirSync(os.tmpdir()).filter(f => f.startsWith(`ststudio-${stamp}`));
+      const outFile  = allFiles.sort().pop();
       if (!outFile) throw new Error("Output file not found after download");
 
       const filePath = path.join(os.tmpdir(), outFile);
-      const ext      = path.extname(outFile).replace(".", "") || "mp4";
-      const mimeMap  = { mp4:"video/mp4", webm:"video/webm", m4a:"audio/m4a", mp3:"audio/mpeg", ogg:"audio/ogg" };
+      const ext      = path.extname(outFile).replace(".","") || "mp4";
+      const mimeMap  = { mp4:"video/mp4",webm:"video/webm",m4a:"audio/m4a",mp3:"audio/mpeg",ogg:"audio/ogg" };
       const mime     = mimeMap[ext] || "application/octet-stream";
       const stat     = fs.statSync(filePath);
 
@@ -357,7 +528,7 @@ function startServer() {
 
       const stream = fs.createReadStream(filePath);
       stream.pipe(res);
-      stream.on("close", () => { try { fs.unlinkSync(filePath); } catch {} });
+      stream.on("close", () => { try{fs.unlinkSync(filePath);}catch{} });
 
     } catch (err) {
       console.error("download error:", err.message);
@@ -366,9 +537,9 @@ function startServer() {
   });
 
   app.listen(PORT, () => {
-    console.log(`\n Speech Studio Server running on port ${PORT}\n`);
+    console.log(`\n  🎙  Speech Studio backend on port ${PORT}\n`);
+    console.log(`  Auth status: ${fs.existsSync(TOKEN_PATH) ? "✅ OAuth token loaded" : "⚠️  No token — visit /auth-url"}\n`);
   });
 }
 
-// start
 boot();
