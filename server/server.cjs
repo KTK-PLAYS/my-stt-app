@@ -253,7 +253,8 @@ async function boot() {
       console.log("Downloading ffmpeg…");
       await downloadFfmpeg();
     } else {
-      console.log("ffmpeg already cached");
+      try { fs.chmodSync(FFMPEG_PATH, "755"); } catch {}
+      console.log("ffmpeg already cached, permissions refreshed");
     }
     const fv = await run(`"${FFMPEG_PATH}" -version 2>&1 | head -1`);
     console.log(fv);
@@ -334,57 +335,46 @@ function startServer() {
     res.json(r);
   });
 
-  // ── /auth-url — prints OAuth2 instructions ──────────────
-  // Visit this endpoint in your browser to start the OAuth flow.
-  // yt-dlp will print a URL + code; you visit the URL, enter the code,
-  // and the token is saved to TOKEN_PATH automatically.
-  app.get("/auth-url", async (req, res) => {
-    if (!fs.existsSync(YTDLP_PATH)) {
-      return res.status(503).send("yt-dlp not ready yet. Try again in 30s.");
-    }
-
+  // ── /auth-url — cookie setup guide ────────────────────────
+  app.get("/auth-url", (req, res) => {
+    const cookieStatus = fs.existsSync(COOKIES_PATH) ? "LOADED (may be expired)" : "NOT SET";
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    res.setHeader("Transfer-Encoding", "chunked");
-
-    res.write("Starting yt-dlp OAuth2 flow...\n\n");
-    res.write("yt-dlp will print a URL and a code below.\n");
-    res.write("1. Open the Google URL printed below in a NEW browser tab\n");
-    res.write("2. Sign in with your Google account and enter the code shown\n");
-    res.write("3. Come back to THIS tab — the token will print at the bottom\n");
-    res.write("4. Copy the JSON and paste it into Railway → Variables → YT_TOKEN_DATA\n\n");
-    res.write("────────────────────────────────────────\n\n");
-
-    const proc = spawn(YTDLP_PATH, [
-      "--username", "oauth2",
-      "--password", "",
-      "--cache-dir", "/tmp/yt-dlp-cache",
-      "--skip-download",
-      "--no-playlist",
-      "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-    ]);
-
-    proc.stdout.on("data", d => res.write(d.toString()));
-    proc.stderr.on("data", d => res.write(d.toString()));
-
-    proc.on("close", () => {
-      const token = readToken();
-      if (token) {
-        res.write("\n\n════════════════════════════════════════\n");
-        res.write("TOKEN SAVED - copy everything between the lines below\n");
-        res.write("and paste it into Railway → Variables → YT_TOKEN_DATA:\n\n");
-        res.write("--- START COPYING FROM NEXT LINE ---\n");
-        res.write(token);
-        res.write("\n--- STOP COPYING AT PREVIOUS LINE ---\n");
-        res.write("════════════════════════════════════════\n");
-      } else {
-        res.write("\n\nNo token file found.\n");
-        res.write("This usually means the token already existed from a previous auth.\n");
-        res.write("Try visiting /check to see the current auth status.\n");
-      }
-      res.end();
-    });
-
-    req.on("close", () => { try { proc.kill(); } catch {} });
+    res.send([
+      "=== YouTube Cookie Setup Guide ===",
+      "",
+      "YouTube no longer supports OAuth in yt-dlp.",
+      "You need to export cookies from your browser. Here is how:",
+      "",
+      "STEP 1 — Install a browser extension:",
+      "  Chrome/Edge: search 'Get cookies.txt LOCALLY' in Chrome Web Store",
+      "  Link: https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc",
+      "  Firefox: search 'cookies.txt' in Firefox Add-ons",
+      "",
+      "STEP 2 — Export cookies:",
+      "  Go to youtube.com and make sure you are LOGGED IN to your Google account",
+      "  Click the extension icon in the toolbar",
+      "  Click 'Export' or 'Download cookies for this tab'",
+      "  A .txt file will download to your computer",
+      "",
+      "STEP 3 — Add to Railway:",
+      "  Open the .txt file in Notepad (Windows) or TextEdit (Mac)",
+      "  Select ALL the text (Ctrl+A or Cmd+A) and Copy",
+      "  Go to Railway → your service → Variables tab",
+      "  Find YOUTUBE_COOKIES → paste as the value → click Save",
+      "  Railway will redeploy automatically (takes ~1 minute)",
+      "",
+      "STEP 4 — Test it:",
+      "  Visit: /check  to confirm cookies are loaded",
+      "  Try a download to confirm it works",
+      "",
+      "NOTE: YouTube cookies expire every few weeks.",
+      "When downloads start failing, just repeat steps 2-3 with fresh cookies.",
+      "",
+      "Current status:",
+      "  Cookies: " + cookieStatus,
+      "  yt-dlp:  " + (fs.existsSync(YTDLP_PATH) ? "ready" : "not downloaded"),
+      "  ffmpeg:  " + (fs.existsSync(FFMPEG_PATH) ? "ready" : "not downloaded"),
+    ].join("\n"));
   });
 
   // ── /save-token  POST { token: "..." } ──────────────────
