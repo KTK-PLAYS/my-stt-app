@@ -386,7 +386,15 @@ function startServer() {
     if (!url || !formatId) return res.status(400).send("Missing url or formatId");
     if (!fs.existsSync(YTDLP_PATH)) return res.status(503).send("yt-dlp not ready");
 
-    const safeTitle = (title || "download").replace(/[^\w\s-]/g, "").trim() || "download";
+    // Preserve the full title — only strip characters that break file systems
+    // Allow: letters, numbers, spaces, hyphens, parentheses, brackets, dots, commas, apostrophes
+    // Remove: / \ : * ? " < > | (illegal on Windows/Linux/Mac)
+    const safeTitle = (title || "download")
+      .replace(/[/\\:*?"<>|]/g, "")   // remove filesystem-illegal chars
+      .replace(/\s+/g, " ")            // collapse multiple spaces
+      .trim()
+      .slice(0, 200)                   // cap length
+      || "download";
     const stamp     = Date.now();
     const outPath   = path.join(os.tmpdir(), `ststudio-${stamp}.%(ext)s`);
     const ffmpeg    = fs.existsSync(FFMPEG_PATH);
@@ -429,7 +437,13 @@ function startServer() {
       const mime     = mimeMap[ext] || "application/octet-stream";
       const stat     = fs.statSync(filePath);
 
-      res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.${ext}"`);
+      // RFC 5987 encoding — supports full Unicode titles (Arabic, Japanese, emoji, etc.)
+      const asciiName   = safeTitle.replace(/[^\x20-\x7E]/g, "_");  // ASCII fallback
+      const encodedName = encodeURIComponent(`${safeTitle}.${ext}`);
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${asciiName}.${ext}"; filename*=UTF-8''${encodedName}`
+      );
       res.setHeader("Content-Type", mime);
       res.setHeader("Content-Length", stat.size);
       res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
