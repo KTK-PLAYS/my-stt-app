@@ -5,9 +5,9 @@ import SpeechInput from "./components/SpeechInput";
 // localStorage helper
 // ─────────────────────────────────────────────
 const LS = {
-  get:    (k, fb) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : fb; } catch (_) { return fb; } },
-  set:    (k, v)  => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (_) { /* ignore */ } },
-  remove: (k)     => { try { localStorage.removeItem(k); } catch (_) { /* ignore */ } },
+  get:    (k, fb) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : fb; } catch { return fb; } },
+  set:    (k, v)  => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  remove: (k)     => { try { localStorage.removeItem(k); } catch {} },
 };
 
 function formatDuration(sec) {
@@ -73,7 +73,7 @@ const FAQ = [
   { q:"Is this free?",
     a:"Completely free. No account, no API key, no subscription. Runs entirely in your browser at zero cost." },
   { q:"How does the media downloader work?",
-    a:"The Downloader tab lets you paste any video URL (YouTube, Twitter, Instagram, TikTok and 1000+ more), fetch all available quality options, then download the file directly to your device. It requires the local backend server (server.js) to be running on port 3001 alongside your Vite dev server." },
+    a:"The Downloader tab lets you paste any video URL (YouTube, Twitter, Instagram, TikTok and 1000+ more), fetch all available quality options, then download the file directly to your device." },
 ];
 
 function HelpModal({ open, onClose, dark }) {
@@ -231,9 +231,9 @@ const TEMPLATES = [
 ];
 
 // ─────────────────────────────────────────────
-// DOWNLOADER PANEL  (new feature)
+// DOWNLOADER PANEL
 // ─────────────────────────────────────────────
-const BACKEND = "http://localhost:3001";
+const BACKEND = "https://my-stt-app-production.up.railway.app";
 
 const SUPPORTED_SITES = [
   { icon:"smart_display",   name:"YouTube"      },
@@ -245,56 +245,88 @@ const SUPPORTED_SITES = [
 ];
 
 function DownloaderPanel({ dark }) {
-  const [url,         setUrl]         = useState("");
-  const [formats,     setFormats]     = useState([]);
-  const [videoInfo,   setVideoInfo]   = useState(null);
-  const [selectedFmt, setSelectedFmt] = useState("");
-  const [status,      setStatus]      = useState("idle"); // idle | fetching | ready | downloading | error
-  const [errorMsg,    setErrorMsg]    = useState("");
-  const [serverOnline,setServerOnline]= useState(null);   // null=checking, true, false
+  const [url,          setUrl]          = useState("");
+  const [formats,      setFormats]      = useState([]);
+  const [videoInfo,    setVideoInfo]    = useState(null);
+  const [selectedFmt,  setSelectedFmt]  = useState("");
+  const [status,       setStatus]       = useState("idle");
+  const [errorMsg,     setErrorMsg]     = useState("");
+  const [serverOnline, setServerOnline] = useState(null);
 
-  // Check backend health on mount
+  // Health-check on mount — retries every 4s for up to 2 minutes
+  // Railway containers take ~30s to boot so a single check always fails
   useEffect(() => {
-    fetch(`${BACKEND}/ping`, { signal: AbortSignal.timeout(3000) })
-      .then(r => setServerOnline(r.ok))
-      .catch(() => setServerOnline(false));
+    let attempts = 0;
+    const MAX    = 30; // 30 × 4s = 2 minutes
+    let timer;
+
+    async function check() {
+      try {
+        const res  = await fetch(`${BACKEND}/ping`, { signal: AbortSignal.timeout(5000) });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          setServerOnline(true);
+          return; // done — stop polling
+        }
+      } catch {}
+
+      attempts++;
+      if (attempts < MAX) {
+        timer = setTimeout(check, 4000);
+      } else {
+        setServerOnline(false); // gave up after 2 min
+      }
+    }
+
+    check();
+    return () => clearTimeout(timer);
   }, []);
 
   const reset = () => {
-    setUrl(""); setFormats([]); setVideoInfo(null);
-    setSelectedFmt(""); setStatus("idle"); setErrorMsg("");
+    setUrl("");
+    setFormats([]);
+    setVideoInfo(null);
+    setSelectedFmt("");
+    setStatus("idle");
+    setErrorMsg("");
   };
 
   const fetchFormats = async () => {
     if (!url.trim()) return;
-    setStatus("fetching"); setFormats([]); setVideoInfo(null); setSelectedFmt(""); setErrorMsg("");
+    setStatus("fetching");
+    setFormats([]);
+    setVideoInfo(null);
+    setSelectedFmt("");
+    setErrorMsg("");
+
     try {
-      const res  = await fetch(`${BACKEND}/formats`, {
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({ url: url.trim() }),
-      });
+      const res = await fetch(`${BACKEND}/formats?url=${encodeURIComponent(url.trim())}`);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Server error ${res.status}`);
+      }
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Failed to fetch formats");
       setVideoInfo({ title: data.title, thumbnail: data.thumbnail, duration: data.duration });
-      setFormats(data.formats);
-      if (data.formats.length) setSelectedFmt(data.formats[0].id);
+      setFormats(data.formats || []);
+      if (data.formats && data.formats.length) setSelectedFmt(data.formats[0].id);
       setStatus("ready");
     } catch (e) {
       setStatus("error");
-      setErrorMsg(e.message || "Could not reach server. Make sure server.js is running.");
+      setErrorMsg(e.message || "Could not reach server.");
     }
   };
 
   const startDownload = () => {
     if (!selectedFmt || !url || !videoInfo) return;
     setStatus("downloading");
+
     const dlUrl =
       `${BACKEND}/download` +
       `?url=${encodeURIComponent(url.trim())}` +
       `&formatId=${encodeURIComponent(selectedFmt)}` +
       `&title=${encodeURIComponent(videoInfo.title || "download")}`;
-    // Use hidden anchor so browser uses Content-Disposition filename from server
+
+    // Hidden anchor — triggers file-save dialog, does NOT navigate the tab
     const a = document.createElement("a");
     a.href = dlUrl;
     a.setAttribute("download", "");
@@ -302,10 +334,11 @@ function DownloaderPanel({ dark }) {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+
     setTimeout(() => setStatus("ready"), 8000);
   };
 
-  // Theme tokens (passed from parent via prop, re-computed locally for clarity)
+  // Theme tokens
   const pri     = "#59de9b";
   const priD    = "#003921";
   const bgLow   = dark ? "#1b1c1a" : "#ffffff";
@@ -385,6 +418,16 @@ function DownloaderPanel({ dark }) {
       </div>
 
       {/* Server status */}
+      {serverOnline === null && (
+        <div style={{
+          marginBottom:18,padding:"9px 16px",borderRadius:10,
+          background:"rgba(232,200,122,0.06)",border:"1px solid rgba(232,200,122,0.2)",
+          display:"flex",alignItems:"center",gap:10,
+        }}>
+          <span className="mat" style={{fontSize:16,color:"#e8c87a",animation:"spin 1s linear infinite"}}>refresh</span>
+          <span style={{fontSize:12,fontWeight:700,color:"#e8c87a"}}>Connecting to server… (may take ~30s on first load)</span>
+        </div>
+      )}
       {serverOnline === false && (
         <div style={{
           marginBottom:18,padding:"14px 18px",borderRadius:12,
@@ -397,7 +440,7 @@ function DownloaderPanel({ dark }) {
               Backend not detected
             </div>
             <div style={{fontSize:12,color:dark?"#c07070":"#a04040",lineHeight:1.6}}>
-              Run <code style={{background:bgHigh,padding:"1px 6px",borderRadius:4,fontFamily:"monospace",fontSize:12}}>node server.js</code> in your project root, then refresh.
+              Could not reach the Railway backend after 2 minutes. Check Railway deployment logs, then refresh this page.
             </div>
           </div>
         </div>
@@ -425,7 +468,10 @@ function DownloaderPanel({ dark }) {
             style={inputStyle}
             placeholder="https://youtube.com/watch?v=… or any supported link"
             value={url}
-            onChange={e => { setUrl(e.target.value); if (status !== "idle") { setStatus("idle"); setFormats([]); setVideoInfo(null); } }}
+            onChange={e => {
+              setUrl(e.target.value);
+              if (status !== "idle") { setStatus("idle"); setFormats([]); setVideoInfo(null); }
+            }}
             onKeyDown={e => e.key === "Enter" && fetchFormats()}
           />
           <button
@@ -448,7 +494,7 @@ function DownloaderPanel({ dark }) {
           )}
         </div>
 
-        {/* Supported sites chips — only visible on idle */}
+        {/* Supported sites chips */}
         {status === "idle" && !videoInfo && (
           <div style={{marginTop:14,display:"flex",flexWrap:"wrap",gap:7}}>
             {SUPPORTED_SITES.map(s => (
@@ -549,7 +595,7 @@ function DownloaderPanel({ dark }) {
         </div>
       )}
 
-      {/* How it works — only on idle empty state */}
+      {/* How it works — idle empty state only */}
       {status === "idle" && !videoInfo && (
         <div style={{background:bgLow,border:`1px solid ${ol}`,borderRadius:16,padding:20}}>
           <div style={{fontSize:13,fontWeight:700,color:onBg,marginBottom:14}}>How it works</div>
@@ -570,16 +616,6 @@ function DownloaderPanel({ dark }) {
                 <span style={{fontSize:13,color:onMuted,lineHeight:1.5}}>{s.text}</span>
               </div>
             ))}
-          </div>
-          <div style={{
-            marginTop:16,padding:"12px 14px",borderRadius:10,
-            background:dark?"rgba(232,200,122,0.06)":"#fffbf0",
-            border:"1px solid rgba(232,200,122,0.2)",
-            fontSize:12,color:dark?"#e8c87a":"#8a6400",lineHeight:1.6,
-          }}>
-            <strong>Requires:</strong> <code style={{fontFamily:"monospace",
-              background:dark?"rgba(255,255,255,0.08)":"rgba(0,0,0,0.06)",
-              padding:"1px 4px",borderRadius:4}}>node server.js</code> running locally on port 3001. See project README for setup.
           </div>
         </div>
       )}
@@ -688,7 +724,6 @@ export default function App() {
     setShowSettings(false); notify("Everything cleared");
   };
 
-  // ── nav — now 5 items including Downloader ──
   const navItems = [
     { id:"studio",     icon:"mic",          label:"Studio"             },
     { id:"recent",     icon:"history",      label:"Recent Dictations"  },
@@ -697,7 +732,7 @@ export default function App() {
     { id:"downloader", icon:"download",     label:"Downloader"         },
   ];
 
-  // ── theme tokens ──────────────────────────
+  // Theme tokens
   const bg      = dark ? "#131412" : "#f8f8f6";
   const bgLow   = dark ? "#1b1c1a" : "#ffffff";
   const bgMid   = dark ? "#1f201e" : "#f2f2f0";
@@ -1159,7 +1194,7 @@ export default function App() {
                 </div>
               )}
 
-              {/* ── DOWNLOADER (new) ── */}
+              {/* DOWNLOADER */}
               {activeNav === "downloader" && (
                 <div className="va-content">
                   <DownloaderPanel dark={dark} />
