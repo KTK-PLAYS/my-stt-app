@@ -1,13 +1,11 @@
 /**
  * server.cjs  —  Speech Studio Media Backend
  * ─────────────────────────────────────────────────────────────────
- * Railway env variables to set:
+ * Railway env variables:
  *
  *   PORT             → auto-set by Railway
- *   YOUTUBE_COOKIES  → your Netscape cookie file content (from browser)
- *   BGUTIL_URL       → internal URL of bgutil service, e.g:
- *                      http://bgutil-provider.railway.internal:4416
- *                      (leave blank to skip PO token — works without it)
+ *   YOUTUBE_COOKIES  → Netscape cookie file content (from browser)
+ *   BGUTIL_URL       → http://bgutil-ytdlp-pot-provider.railway.internal:4416
  * ─────────────────────────────────────────────────────────────────
  */
 
@@ -26,14 +24,14 @@ app.use(cors());
 app.use(express.json());
 
 // ── paths ─────────────────────────────────────────────────────
-const YTDLP_PATH    = "/tmp/yt-dlp";
-const FFMPEG_PATH   = "/tmp/ffmpeg";
-const COOKIES_PATH  = "/tmp/yt-cookies.txt";
-const PLUGIN_DIR    = "/tmp/yt-dlp-plugins";
+const YTDLP_PATH   = "/tmp/yt-dlp";
+const FFMPEG_PATH  = "/tmp/ffmpeg";
+const COOKIES_PATH = "/tmp/yt-cookies.txt";
+const PLUGIN_DIR   = "/tmp/yt-dlp-plugins";
+const NODE_PATH    = process.execPath; // the Node.js binary running this script
 
-// bgutil PO token provider service URL
-// Set BGUTIL_URL in Railway to your bgutil service internal URL
-const BGUTIL_URL = process.env.BGUTIL_URL || "";
+// bgutil PO token provider — set BGUTIL_URL in Railway variables
+const BGUTIL_URL = (process.env.BGUTIL_URL || "").trim();
 
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -61,83 +59,131 @@ function downloadBinary(url, destPath, label) {
       if (hops > 8) { reject(new Error("Too many redirects")); return; }
       const mod = fetchUrl.startsWith("https") ? https : http;
       mod.get(fetchUrl, (res) => {
-        if ([301,302,307,308].includes(res.statusCode)) { fetch(res.headers.location, hops+1); return; }
-        if (res.statusCode !== 200) { reject(new Error(`HTTP ${res.statusCode} for ${label}`)); return; }
+        if ([301, 302, 307, 308].includes(res.statusCode)) {
+          fetch(res.headers.location, hops + 1); return;
+        }
+        if (res.statusCode !== 200) {
+          reject(new Error(`HTTP ${res.statusCode} for ${label}`)); return;
+        }
         res.pipe(file);
         file.on("finish", () => {
           file.close();
-          try { fs.chmodSync(destPath, "755"); } catch {}
+          try { fs.chmodSync(destPath, "755"); } catch (e) { console.warn("chmod failed:", e.message); }
           console.log(`${label} ready`);
           resolve();
         });
-      }).on("error", (e) => { try { fs.unlinkSync(destPath); } catch {} reject(e); });
+      }).on("error", (e) => { try { fs.unlinkSync(destPath); } catch (_) {} reject(e); });
     }
     fetch(url);
   });
 }
 
-// ── setup cookies from env var ────────────────────────────────
+// ── cookies setup ─────────────────────────────────────────────
 function setupCookies() {
   const data = process.env.YOUTUBE_COOKIES;
   if (data && data.trim()) {
     fs.writeFileSync(COOKIES_PATH, data, "utf8");
     console.log("YouTube cookies written");
   } else {
-    console.warn("YOUTUBE_COOKIES not set — YouTube downloads may fail");
+    console.warn("YOUTUBE_COOKIES not set");
   }
 }
 
 // ── install bgutil yt-dlp plugin ──────────────────────────────
-// The plugin tells yt-dlp to fetch PO tokens from our bgutil sidecar
 async function installBgutilPlugin() {
   if (!BGUTIL_URL) {
-    console.log("BGUTIL_URL not set — skipping PO token plugin install");
+    console.log("BGUTIL_URL not set — skipping PO token plugin");
     return;
   }
   try {
-    const pluginZip = "/tmp/bgutil-plugin.zip";
     const pluginDest = path.join(PLUGIN_DIR, "bgutil-ytdlp-pot-provider.zip");
-
     if (fs.existsSync(pluginDest)) {
       console.log("bgutil plugin already installed");
       return;
     }
-
     fs.mkdirSync(PLUGIN_DIR, { recursive: true });
-
-    // Download the plugin zip from the latest release
+    const tmpZip = "/tmp/bgutil-plugin.zip";
     await downloadBinary(
       "https://github.com/Brainicism/bgutil-ytdlp-pot-provider/releases/latest/download/bgutil-ytdlp-pot-provider.zip",
-      pluginZip,
+      tmpZip,
       "bgutil yt-dlp plugin"
     );
-
-    fs.copyFileSync(pluginZip, pluginDest);
-    try { fs.unlinkSync(pluginZip); } catch {}
-    console.log("bgutil plugin installed to", pluginDest);
+    fs.copyFileSync(tmpZip, pluginDest);
+    try { fs.unlinkSync(tmpZip); } catch (_) {}
+    console.log("bgutil plugin installed →", pluginDest);
   } catch (e) {
     console.warn("bgutil plugin install failed:", e.message);
-    console.warn("Downloads will still work but may hit PO token 403 errors");
   }
 }
 
-// ── check if bgutil service is alive ─────────────────────────
+// ── check bgutil service health ───────────────────────────────
 function checkBgutil() {
   return new Promise((resolve) => {
     if (!BGUTIL_URL) { resolve(false); return; }
     try {
       const parsed = new URL(BGUTIL_URL);
       const mod    = parsed.protocol === "https:" ? https : http;
-      const req    = mod.get(`${BGUTIL_URL}/`, (res) => {
-        resolve(res.statusCode < 500);
-      });
+      const req    = mod.get(`${BGUTIL_URL}/`, (res) => { resolve(res.statusCode < 500); });
       req.on("error", () => resolve(false));
       req.setTimeout(3000, () => { req.destroy(); resolve(false); });
-    } catch { resolve(false); }
+    } catch (_) { resolve(false); }
   });
 }
 
-// ── build yt-dlp args ─────────────────────────────────────────
+// ── ffmpeg download ───────────────────────────────────────────
+function downloadFfmpeg() {
+  return new Promise((resolve, reject) => {
+    // Use a .gz build instead of .xz — Railway containers don't have xz
+    // John Van Sickle also provides a gzip version
+    const tarUrl = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.gz";
+    const cmd =
+      `curl -sL "${tarUrl}" | tar -xz --wildcards --no-anchored "*/ffmpeg" ` +
+      `-O > "${FFMPEG_PATH}" && chmod 755 "${FFMPEG_PATH}"`;
+    exec(cmd, { timeout: 300000, maxBuffer: 200 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        console.log("curl/tar failed, trying Node stream…", stderr.slice(0, 200));
+        downloadFfmpegNodeStream().then(resolve).catch(reject);
+        return;
+      }
+      console.log("ffmpeg extracted via curl+tar");
+      resolve();
+    });
+  });
+}
+
+function downloadFfmpegNodeStream() {
+  return new Promise((resolve, reject) => {
+    // Fall back to the gz archive using Node https + tar gz (no xz needed)
+    const tarUrl = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.gz";
+    const tmpTar = "/tmp/ffmpeg.tar.gz";
+    const file   = fs.createWriteStream(tmpTar);
+    console.log("Streaming ffmpeg tar.gz via Node…");
+
+    function fetch(url, hops = 0) {
+      if (hops > 8) { reject(new Error("Too many redirects")); return; }
+      const mod = url.startsWith("https") ? https : http;
+      mod.get(url, (res) => {
+        if ([301, 302, 307, 308].includes(res.statusCode)) { fetch(res.headers.location, hops + 1); return; }
+        if (res.statusCode !== 200) { reject(new Error(`HTTP ${res.statusCode}`)); return; }
+        res.pipe(file);
+        file.on("finish", () => {
+          file.close();
+          // tar gz — no xz needed
+          const cmd = `tar -xzf "${tmpTar}" --wildcards --no-anchored "*/ffmpeg" -O > "${FFMPEG_PATH}" && chmod 755 "${FFMPEG_PATH}"`;
+          exec(cmd, { timeout: 180000 }, (err2) => {
+            try { fs.unlinkSync(tmpTar); } catch (_) {}
+            if (err2) { reject(err2); return; }
+            console.log("ffmpeg extracted via Node stream");
+            resolve();
+          });
+        });
+      }).on("error", reject);
+    }
+    fetch(tarUrl);
+  });
+}
+
+// ── arg builders ──────────────────────────────────────────────
 function getCookieArgs() {
   return fs.existsSync(COOKIES_PATH) ? ["--cookies", COOKIES_PATH] : [];
 }
@@ -150,58 +196,24 @@ function getFfmpegArgs() {
 function getFfmpegFlag() {
   return fs.existsSync(FFMPEG_PATH) ? `--ffmpeg-location "${FFMPEG_PATH}"` : "";
 }
+// Tell yt-dlp to use the Node.js binary that is running this script
+// This fixes: "No supported JavaScript runtime could be found"
+function getJsRuntimeArgs() {
+  return ["--js-runtimes", `node:${NODE_PATH}`];
+}
+function getJsRuntimeFlag() {
+  return `--js-runtimes "node:${NODE_PATH}"`;
+}
 function getPluginArgs() {
   if (!BGUTIL_URL || !fs.existsSync(PLUGIN_DIR)) return [];
-  return ["--plugin-dirs", PLUGIN_DIR,
-          "--extractor-args", `youtubepot-bgutilhttp:base_url=${BGUTIL_URL}`];
+  return [
+    "--plugin-dirs", PLUGIN_DIR,
+    "--extractor-args", `youtubepot-bgutilhttp:base_url=${BGUTIL_URL}`,
+  ];
 }
 function getPluginFlag() {
   if (!BGUTIL_URL || !fs.existsSync(PLUGIN_DIR)) return "";
   return `--plugin-dirs "${PLUGIN_DIR}" --extractor-args "youtubepot-bgutilhttp:base_url=${BGUTIL_URL}"`;
-}
-
-// ── ffmpeg download ───────────────────────────────────────────
-function downloadFfmpeg() {
-  return new Promise((resolve, reject) => {
-    const tarUrl =
-      "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz";
-    const cmd =
-      `curl -sL "${tarUrl}" | tar -xJ --wildcards --no-anchored "*/ffmpeg" ` +
-      `-O > "${FFMPEG_PATH}" && chmod 755 "${FFMPEG_PATH}"`;
-    exec(cmd, { timeout: 180000, maxBuffer: 100 * 1024 * 1024 }, (err) => {
-      if (err) { downloadFfmpegNodeStream().then(resolve).catch(reject); return; }
-      console.log("ffmpeg extracted via curl");
-      resolve();
-    });
-  });
-}
-
-function downloadFfmpegNodeStream() {
-  return new Promise((resolve, reject) => {
-    const tarUrl = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz";
-    const tmpTar = "/tmp/ffmpeg.tar.xz";
-    const file   = fs.createWriteStream(tmpTar);
-    function fetch(url, hops = 0) {
-      if (hops > 8) { reject(new Error("Too many redirects")); return; }
-      const mod = url.startsWith("https") ? https : http;
-      mod.get(url, (res) => {
-        if ([301,302,307,308].includes(res.statusCode)) { fetch(res.headers.location, hops+1); return; }
-        if (res.statusCode !== 200) { reject(new Error(`HTTP ${res.statusCode}`)); return; }
-        res.pipe(file);
-        file.on("finish", () => {
-          file.close();
-          const cmd = `tar -xJf "${tmpTar}" --wildcards --no-anchored "*/ffmpeg" -O > "${FFMPEG_PATH}" && chmod 755 "${FFMPEG_PATH}"`;
-          exec(cmd, { timeout: 120000 }, (err) => {
-            try { fs.unlinkSync(tmpTar); } catch {}
-            if (err) { reject(err); return; }
-            console.log("ffmpeg extracted via Node stream");
-            resolve();
-          });
-        });
-      }).on("error", reject);
-    }
-    fetch(tarUrl);
-  });
 }
 
 // ── boot ──────────────────────────────────────────────────────
@@ -218,40 +230,41 @@ async function boot() {
     console.log(`yt-dlp ${v}`);
   } catch (e) { console.error("yt-dlp setup failed:", e.message); }
 
-  // 2. ffmpeg
+  // 2. ffmpeg (using .gz — no xz dependency)
   try {
     if (!fs.existsSync(FFMPEG_PATH)) {
-      console.log("Downloading ffmpeg…");
       await downloadFfmpeg();
     } else {
-      try { fs.chmodSync(FFMPEG_PATH, "755"); } catch {}
-      console.log("ffmpeg already cached, permissions refreshed");
+      try { fs.chmodSync(FFMPEG_PATH, "755"); } catch (_) {}
+      console.log("ffmpeg already cached");
     }
     const fv = await run(`"${FFMPEG_PATH}" -version 2>&1 | head -1`);
     console.log(fv);
   } catch (e) {
-    console.warn("ffmpeg unavailable:", e.message);
+    console.warn("ffmpeg unavailable — merging disabled:", e.message);
   }
 
-  // 3. bgutil PO token plugin
+  // 3. bgutil plugin
   await installBgutilPlugin();
 
-  // 4. check bgutil connectivity
+  // 4. bgutil health check
   const bgutilAlive = await checkBgutil();
   if (BGUTIL_URL) {
-    console.log(`bgutil service: ${bgutilAlive ? "ONLINE ✅" : "OFFLINE ⚠️ (will retry per-request)"}`);
+    console.log(`bgutil: ${bgutilAlive ? "ONLINE ✅" : "OFFLINE ⚠️"} — ${BGUTIL_URL}`);
   }
+
+  // 5. log Node path so we can confirm JS runtime
+  console.log(`Node.js runtime: ${NODE_PATH}`);
 
   startServer();
 }
 
-// ── server routes ─────────────────────────────────────────────
+// ── routes ────────────────────────────────────────────────────
 function startServer() {
 
   app.get("/ping",   (_, res) => res.json({ ok: true }));
   app.get("/health", (_, res) => res.json({ ok: true }));
 
-  // /check — full status
   app.get("/check", async (_, res) => {
     const bgutilAlive = await checkBgutil();
     const r = {
@@ -259,44 +272,47 @@ function startServer() {
       ffmpeg:  { exists: fs.existsSync(FFMPEG_PATH) },
       cookies: fs.existsSync(COOKIES_PATH),
       bgutil:  { url: BGUTIL_URL || "(not set)", online: bgutilAlive },
-      plugin:  fs.existsSync(PLUGIN_DIR),
+      plugin:  fs.existsSync(path.join(PLUGIN_DIR, "bgutil-ytdlp-pot-provider.zip")),
+      nodeRuntime: NODE_PATH,
     };
-    try { r.ytdlp.version  = await run(`"${YTDLP_PATH}" --version`); }          catch (e) { r.ytdlp.error  = e.message; }
+    try { r.ytdlp.version  = await run(`"${YTDLP_PATH}" --version`); }               catch (e) { r.ytdlp.error  = e.message; }
     try { r.ffmpeg.version = await run(`"${FFMPEG_PATH}" -version 2>&1 | head -1`); } catch (e) { r.ffmpeg.error = e.message; }
     res.json(r);
   });
 
-  // /auth-url — cookie setup instructions
   app.get("/auth-url", (_, res) => {
-    const cookieStatus = fs.existsSync(COOKIES_PATH) ? "LOADED" : "NOT SET";
-    const bgutilStatus = BGUTIL_URL ? `configured (${BGUTIL_URL})` : "NOT SET";
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.send([
       "=== Speech Studio Backend Status ===",
       "",
-      `Cookies:       ${cookieStatus}`,
-      `bgutil PO token: ${bgutilStatus}`,
-      `yt-dlp:        ${fs.existsSync(YTDLP_PATH) ? "ready" : "not downloaded"}`,
-      `ffmpeg:        ${fs.existsSync(FFMPEG_PATH) ? "ready" : "not downloaded"}`,
+      `Cookies:  ${fs.existsSync(COOKIES_PATH) ? "loaded" : "MISSING — see setup below"}`,
+      `bgutil:   ${BGUTIL_URL ? `${BGUTIL_URL}` : "not configured"}`,
+      `yt-dlp:   ${fs.existsSync(YTDLP_PATH) ? "ready" : "not downloaded"}`,
+      `ffmpeg:   ${fs.existsSync(FFMPEG_PATH) ? "ready" : "not downloaded"}`,
+      `Node.js:  ${NODE_PATH}`,
       "",
-      "=== Setup Guide ===",
+      "=== Cookie Setup (required for YouTube) ===",
       "",
-      "COOKIES (required for YouTube):",
-      "  1. Install 'Get cookies.txt LOCALLY' Chrome extension",
-      "  2. Go to youtube.com while logged in",
-      "  3. Click extension → Export cookies",
-      "  4. Open the .txt file, copy ALL text",
-      "  5. Railway → Variables → YOUTUBE_COOKIES → paste → Save",
+      "Your cookies have EXPIRED — YouTube rotated them.",
+      "You need to re-export them from your browser.",
       "",
-      "PO TOKENS (recommended, prevents 403 errors):",
-      "  1. In Railway → your project → New Service → Docker Image",
-      "  2. Image name: brainicism/bgutil-ytdlp-pot-provider:latest",
-      "  3. Deploy it, note the internal hostname from Settings",
-      "  4. Railway → your main service → Variables → add:",
-      "     BGUTIL_URL = http://<internal-hostname>.railway.internal:4416",
-      "  5. Redeploy your main service",
+      "1. Install 'Get cookies.txt LOCALLY' Chrome extension:",
+      "   https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc",
       "",
-      "Visit /check to verify everything is working.",
+      "2. Go to youtube.com — make sure you are LOGGED IN",
+      "",
+      "3. Click the extension icon → click 'Export' or the youtube.com row",
+      "   A .txt file downloads to your computer",
+      "",
+      "4. Open the .txt file in Notepad, press Ctrl+A, Ctrl+C",
+      "",
+      "5. Railway → your main service → Variables → YOUTUBE_COOKIES",
+      "   Delete old value → Paste new value → Save",
+      "   Railway redeploys automatically (~1 min)",
+      "",
+      "=== bgutil PO Token (auto-handles bot checks) ===",
+      `Status: ${BGUTIL_URL ? "configured" : "NOT SET"}`,
+      "BGUTIL_URL should be: http://bgutil-ytdlp-pot-provider.railway.internal:4416",
     ].join("\n"));
   });
 
@@ -304,7 +320,7 @@ function startServer() {
   app.get("/formats", async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).json({ error: "No URL provided" });
-    if (!fs.existsSync(YTDLP_PATH)) return res.status(503).json({ error: "yt-dlp not ready yet — try in 30s" });
+    if (!fs.existsSync(YTDLP_PATH)) return res.status(503).json({ error: "yt-dlp not ready — wait 30s" });
 
     try {
       const raw = await run(
@@ -312,6 +328,7 @@ function startServer() {
         `--no-check-certificates --extractor-retries 3 ` +
         `--user-agent "${USER_AGENT}" ` +
         `--add-header "Accept-Language:en-US,en;q=0.9" ` +
+        `${getJsRuntimeFlag()} ` +
         `${getCookieFlag()} ` +
         `${getFfmpegFlag()} ` +
         `${getPluginFlag()} ` +
@@ -359,7 +376,7 @@ function startServer() {
       });
     } catch (err) {
       console.error("formats error:", err.message);
-      res.status(500).json({ error: "Could not fetch video info: " + err.message });
+      res.status(500).json({ error: err.message });
     }
   });
 
@@ -387,6 +404,7 @@ function startServer() {
           "--extractor-retries", "3",
           "--user-agent", USER_AGENT,
           "--add-header", "Accept-Language:en-US,en;q=0.9",
+          ...getJsRuntimeArgs(),
           ...getCookieArgs(),
           ...getFfmpegArgs(),
           ...getPluginArgs(),
@@ -407,7 +425,7 @@ function startServer() {
 
       const filePath = path.join(os.tmpdir(), outFile);
       const ext      = path.extname(outFile).replace(".", "") || "mp4";
-      const mimeMap  = { mp4:"video/mp4", webm:"video/webm", m4a:"audio/m4a", mp3:"audio/mpeg", ogg:"audio/ogg" };
+      const mimeMap  = { mp4: "video/mp4", webm: "video/webm", m4a: "audio/m4a", mp3: "audio/mpeg", ogg: "audio/ogg" };
       const mime     = mimeMap[ext] || "application/octet-stream";
       const stat     = fs.statSync(filePath);
 
@@ -418,7 +436,7 @@ function startServer() {
 
       const stream = fs.createReadStream(filePath);
       stream.pipe(res);
-      stream.on("close", () => { try { fs.unlinkSync(filePath); } catch {} });
+      stream.on("close", () => { try { fs.unlinkSync(filePath); } catch (_) {} });
 
     } catch (err) {
       console.error("download error:", err.message);
@@ -428,9 +446,10 @@ function startServer() {
 
   app.listen(PORT, () => {
     console.log(`\n  Speech Studio backend on port ${PORT}`);
-    console.log(`  Cookies:  ${fs.existsSync(COOKIES_PATH) ? "loaded" : "missing"}`);
-    console.log(`  bgutil:   ${BGUTIL_URL || "not configured"}`);
-    console.log(`  ffmpeg:   ${fs.existsSync(FFMPEG_PATH) ? "ready" : "downloading"}\n`);
+    console.log(`  Cookies: ${fs.existsSync(COOKIES_PATH) ? "loaded" : "MISSING"}`);
+    console.log(`  bgutil:  ${BGUTIL_URL || "not configured"}`);
+    console.log(`  ffmpeg:  ${fs.existsSync(FFMPEG_PATH) ? "ready" : "not ready"}`);
+    console.log(`  Node:    ${NODE_PATH}\n`);
   });
 }
 

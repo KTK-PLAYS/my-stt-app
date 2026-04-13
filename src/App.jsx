@@ -6,9 +6,9 @@ import SpeechInput from "./components/SpeechInput";
 // ─────────────────────────────────────────────
 const LS = {
   get:    (k, fb) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : fb; } catch { return fb; } },
-  set:    (k, v)  => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  set:    (k, v)  => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { } },
   remove: (k)     => { try { localStorage.removeItem(k); } catch {} },
-};
+}; 
 
 function formatDuration(sec) {
   const m = Math.floor(sec / 60), s = sec % 60;
